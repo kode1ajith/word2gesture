@@ -1,0 +1,1450 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Sentence playback</title>
+<style>
+  html, body {
+    margin:0; padding:0; overflow:hidden; height:100%;
+    background: linear-gradient(180deg, #f7ecda 0%, #f0ddc3 55%, #dcbd9c 100%);
+  }
+  body { display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; }
+  input, button { font: 13px/1.4 sans-serif; }
+  details summary { cursor: pointer; color:#555; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/node_modules/three/build/three.module.js",
+    "three/addons/": "/node_modules/three/examples/jsm/",
+    "@pixiv/three-vrm": "/node_modules/@pixiv/three-vrm/lib/three-vrm.module.js",
+    "kalidokit": "/node_modules/kalidokit/dist/kalidokit.es.js"
+  }
+}
+</script>
+</head>
+<body>
+<!-- Sentence playback (2026-10-03): types a space-separated sequence of
+     library gloss words (multi-word glosses like "TRAIN STATION" are typed
+     as-is and matched as one unit -- see matchSentence() below) and plays
+     them back-to-back on the avatar, jump-cut between words (no blending --
+     that's an explicit, deliberate v1 scope call, see project doc). If any
+     word in the sentence isn't in the (gold-marked) library, the whole
+     sentence is dropped and the "STOP!" gesture plays instead, per AK's
+     instruction: full coverage or STOP!, nothing in between for v1. -->
+<div id="ui" style="position:fixed; top:8px; left:8px; z-index:10; font:13px/1.4 sans-serif; background:rgba(255,255,255,0.92); padding:10px 12px; border-radius:6px; width:420px;">
+  <div style="margin-bottom:6px;">
+    <a href="/index.html" style="font-size:12px;">&larr; Player</a>
+    &nbsp;|&nbsp; <a href="/gold_review.html" style="font-size:12px;">Gold review</a>
+    &nbsp;|&nbsp; <b>Sentence playback</b>
+  </div>
+  <div style="margin-bottom:6px; display:flex; gap:8px;">
+    <input id="sentenceInput" type="text" placeholder="e.g. I LOVE YOU" style="flex:1; padding:5px; box-sizing:border-box;">
+    <button id="playBtn">Play</button>
+  </div>
+  <div id="statusLine" style="margin-bottom:6px; font-size:12px; color:#555;"></div>
+  <details>
+    <summary>Known English sentences (<span id="sentenceCount">0</span>) — type one of these as-is</summary>
+    <div id="sentenceList" style="max-height:160px; overflow-y:auto; font-size:12px; margin-top:4px; line-height:1.6;"></div>
+  </details>
+  <details>
+    <summary>Available gloss words (<span id="wordCount">0</span>)</summary>
+    <div id="wordList" style="max-height:160px; overflow-y:auto; font-size:12px; margin-top:4px; line-height:1.6;"></div>
+  </details>
+</div>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { VRMLoaderPlugin, VRMUtils } from "@pixiv/three-vrm";
+import * as Kalidokit from "kalidokit";
+
+const W = 900, H = 900;
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setSize(W, H);
+renderer.setClearColor(0xf0ddc3, 1);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+// Homely backdrop (2026-10-04, AK: "add some background, that should appear
+// like a homely setting"; verbatim from index.html). Simple warm vertical
+// gradient, no external image assets to source/host -- colors match the
+// page's own CSS gradient (see <style> above) so there's no seam.
+function makeHomelyBackground() {
+  const c = document.createElement("canvas");
+  c.width = 2; c.height = 256;
+  const ctx = c.getContext("2d");
+  const grad = ctx.createLinearGradient(0, 0, 0, 256);
+  grad.addColorStop(0, "#f7ecda");
+  grad.addColorStop(0.55, "#f0ddc3");
+  grad.addColorStop(1, "#dcbd9c");
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 2, 256);
+  return new THREE.CanvasTexture(c);
+}
+scene.background = makeHomelyBackground();
+const camera = new THREE.PerspectiveCamera(28, W / H, 0.1, 20);
+camera.position.set(0, 1.35, 2.2);
+camera.lookAt(0, 1.2, 0);
+
+scene.add(new THREE.AmbientLight(0xffffff, 1.1));
+const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+dir.position.set(1, 2, 2);
+scene.add(dir);
+
+const loader = new GLTFLoader();
+loader.register((parser) => new VRMLoaderPlugin(parser));
+
+let vrm = null;
+let entry = null;        // currently-loaded instance (same shape as entry_*.json)
+let curLibrary = null;   // "dh_library" | "ndh_library" | "head_library", for this entry
+
+function getBone(name) {
+  return vrm.humanoid.getNormalizedBoneNode(name);
+}
+
+// --- Verbatim from the approved production renderer / gold_review.html ---
+// Same bone map, same geometric wrist/palm fit + smoothing, same arm
+// retarget, same axis convention, same head/face handling, same general
+// clearance system -- sentence playback must render exactly what AK already
+// validated word-by-word, so none of this is re-derived here.
+const HAND_BONE_MAP = {
+  Wrist: "Hand",
+  ThumbProximal: "ThumbMetacarpal",
+  ThumbIntermediate: "ThumbProximal",
+  ThumbDistal: "ThumbDistal",
+  IndexProximal: "IndexProximal",
+  IndexIntermediate: "IndexIntermediate",
+  IndexDistal: "IndexDistal",
+  MiddleProximal: "MiddleProximal",
+  MiddleIntermediate: "MiddleIntermediate",
+  MiddleDistal: "MiddleDistal",
+  RingProximal: "RingProximal",
+  RingIntermediate: "RingIntermediate",
+  RingDistal: "RingDistal",
+  LittleProximal: "LittleProximal",
+  LittleIntermediate: "LittleIntermediate",
+  LittleDistal: "LittleDistal",
+};
+
+let handRest = null;
+const WRIST_SMOOTHING_ALPHA = 0.4;
+let lastHandLocalQuat = { Right: null, Left: null };
+function captureHandRest() {
+  vrm.scene.updateMatrixWorld(true);
+  handRest = {};
+  for (const side of ["Right", "Left"]) {
+    const p = side.toLowerCase();
+    const hand = getBone(p + "Hand");
+    const middleProx = getBone(p + "MiddleProximal");
+    const indexProx = getBone(p + "IndexProximal");
+    const littleProx = getBone(p + "LittleProximal");
+    if (!hand || !middleProx || !indexProx || !littleProx) continue;
+    const handPos = new THREE.Vector3(); hand.getWorldPosition(handPos);
+    const midPos = new THREE.Vector3(); middleProx.getWorldPosition(midPos);
+    const idxPos = new THREE.Vector3(); indexProx.getWorldPosition(idxPos);
+    const ltlPos = new THREE.Vector3(); littleProx.getWorldPosition(ltlPos);
+    const forward = midPos.clone().sub(handPos).normalize();
+    const normal = idxPos.clone().sub(handPos).cross(ltlPos.clone().sub(handPos)).normalize();
+    const worldQuat = new THREE.Quaternion();
+    hand.getWorldQuaternion(worldQuat);
+    handRest[side] = { worldQuat, forward, normal };
+  }
+}
+
+function basisQuatFromVectors(primary, secondary) {
+  const x = primary.clone().normalize();
+  let z = x.clone().cross(secondary).normalize();
+  if (z.lengthSq() < 1e-6) z = x.clone().cross(new THREE.Vector3(0, 1, 0)).normalize();
+  const y = z.clone().cross(x).normalize();
+  const m = new THREE.Matrix4().makeBasis(x, y, z);
+  return new THREE.Quaternion().setFromRotationMatrix(m);
+}
+
+function applyHand(landmarks21, side) {
+  if (!landmarks21) return false;
+  const lm = landmarks21.map(([x, y, z]) => ({ x, y, z }));
+  const solved = Kalidokit.Hand.solve(lm, side);
+  if (!solved) return false;
+  const useGeoFingers = window.__fingerMode !== "kalidokit" && !!(handRest && handRest[side]) && landmarks21.length >= 21;
+  for (const [kKey, vrmSuffix] of Object.entries(HAND_BONE_MAP)) {
+    const val = solved[side + kKey];
+    if (!val) continue;
+    const boneName = side.toLowerCase() + vrmSuffix;
+    const bone = getBone(boneName);
+    if (!bone) continue;
+    if (kKey === "Wrist") {
+      const rest = handRest && handRest[side];
+      if (rest && landmarks21.length >= 18) {
+        const wrist = bodyPointToYUp(landmarks21[0]);
+        const middleMcp = bodyPointToYUp(landmarks21[9]);
+        const indexMcp = bodyPointToYUp(landmarks21[5]);
+        const pinkyMcp = bodyPointToYUp(landmarks21[17]);
+        const obsForward = middleMcp.clone().sub(wrist).normalize();
+        const obsNormal = indexMcp.clone().sub(wrist).cross(pinkyMcp.clone().sub(wrist)).normalize();
+        const restBasisQuat = basisQuatFromVectors(rest.forward, rest.normal);
+        const obsBasisQuat = basisQuatFromVectors(obsForward, obsNormal);
+        const delta = obsBasisQuat.clone().multiply(restBasisQuat.clone().invert());
+        const newWorldQuat = delta.clone().multiply(rest.worldQuat);
+        const parent = bone.parent;
+        const parentWorldQuat = new THREE.Quaternion();
+        if (parent) parent.getWorldQuaternion(parentWorldQuat);
+        let localQuat = parentWorldQuat.clone().invert().multiply(newWorldQuat);
+        const lastLocal = lastHandLocalQuat[side];
+        if (lastLocal) localQuat = lastLocal.clone().slerp(localQuat, WRIST_SMOOTHING_ALPHA);
+        bone.quaternion.copy(localQuat);
+        lastHandLocalQuat[side] = localQuat.clone();
+      } else {
+        const e = new THREE.Euler(val.x || 0, val.y || 0, val.z || 0, "XYZ");
+        bone.quaternion.setFromEuler(e);
+        lastHandLocalQuat[side] = null;
+      }
+    } else {
+      // Fidelity pass 2026-10-05: fingers handled by applyFingersGeometric()
+      // below; Kalidokit path kept via window.__fingerMode = "kalidokit".
+      if (!useGeoFingers) {
+        const e = new THREE.Euler(-(val.x || 0), -(val.y || 0), -(val.z || 0), "XYZ");
+        bone.quaternion.setFromEuler(e);
+      }
+    }
+  }
+  if (useGeoFingers) applyFingersGeometric(landmarks21, side);
+  return true;
+}
+
+// --- Geometric finger retarget (Fidelity pass, 2026-10-05) -----------------
+// Measured against the recorded landmarks (palm-frame segment-direction error,
+// all 4 entries): Kalidokit's per-joint Euler angles left fingers 16-40 deg off
+// and the dominant-hand thumb tip 52 deg off (non-dominant 29), with a
+// left/right-asymmetric bias. Cause: Kalidokit solves joint flexion without
+// knowing this rig's rest geometry (finger/thumb bones are not straight at
+// rest) and clamps ranges. Fix: same principle as the arm chain -- rotate each
+// bone, in its parent's current frame, by the minimal swing that takes its
+// rest direction (toward its child) onto the observed landmark segment
+// direction. Processed proximal -> distal so each parent is already posed.
+// Twist about a finger's own axis is undetermined by landmarks and left to the
+// minimal swing. Applies identically to both hands.
+const FINGER_CHAINS = {
+  Thumb:  { bones: ["ThumbMetacarpal", "ThumbProximal", "ThumbDistal"], lm: [1, 2, 3, 4] },
+  Index:  { bones: ["IndexProximal", "IndexIntermediate", "IndexDistal"], lm: [5, 6, 7, 8] },
+  Middle: { bones: ["MiddleProximal", "MiddleIntermediate", "MiddleDistal"], lm: [9, 10, 11, 12] },
+  Ring:   { bones: ["RingProximal", "RingIntermediate", "RingDistal"], lm: [13, 14, 15, 16] },
+  Little: { bones: ["LittleProximal", "LittleIntermediate", "LittleDistal"], lm: [17, 18, 19, 20] },
+};
+function applyFingersGeometric(lms, side) {
+  const prefix = side.toLowerCase();
+  const parentQ = new THREE.Quaternion();
+  for (const ch of Object.values(FINGER_CHAINS)) {
+    for (let k = 0; k < 3; k++) {
+      const bone = getBone(prefix + ch.bones[k]);
+      if (!bone || !bone.parent) continue;
+      // The distal bone has no child in the normalized skeleton (the fingertip
+      // node only exists on the raw one), so its rest direction is taken as the
+      // continuation of its own offset from its parent -- the same direction
+      // the rig's bind pose gives that segment.
+      const childBone = k < 2 ? getBone(prefix + ch.bones[k + 1]) : null;
+      if (k < 2 && !childBone) continue;
+      const a = lms[ch.lm[k]], b = lms[ch.lm[k + 1]];
+      if (!a || !b) continue;
+      const target = bodyPointToYUp(b).sub(bodyPointToYUp(a));
+      if (!(target.lengthSq() > 1e-12)) continue; // also rejects NaN
+      target.normalize();
+      bone.parent.getWorldQuaternion(parentQ);
+      target.applyQuaternion(parentQ.invert());
+      const dRest = (childBone ? childBone.position : bone.position).clone().normalize();
+      bone.quaternion.setFromUnitVectors(dRest, target);
+    }
+  }
+}
+
+
+const ARM_CHAIN = [
+  { bone: "rightUpperArm", fromIdx: 12, toIdx: 14 },
+  { bone: "rightLowerArm", fromIdx: 14, toIdx: 16 },
+  { bone: "leftUpperArm", fromIdx: 11, toIdx: 13 },
+  { bone: "leftLowerArm", fromIdx: 13, toIdx: 15 },
+];
+let armRest = null;
+function captureArmRest() {
+  vrm.scene.updateMatrixWorld(true);
+  armRest = {};
+  for (const { bone: boneName } of ARM_CHAIN) {
+    const bone = getBone(boneName);
+    if (!bone) continue;
+    const childName = boneName.includes("Upper") ? boneName.replace("Upper", "Lower") : boneName.replace("LowerArm", "Hand");
+    const child = getBone(childName);
+    if (!child) continue;
+    const bonePos = new THREE.Vector3(), childPos = new THREE.Vector3();
+    bone.getWorldPosition(bonePos);
+    child.getWorldPosition(childPos);
+    const worldDir = childPos.clone().sub(bonePos).normalize();
+    const worldQuat = new THREE.Quaternion();
+    bone.getWorldQuaternion(worldQuat);
+    armRest[boneName] = { worldDir, worldQuat };
+  }
+}
+
+const AXIS_SIGN_MODES = {
+  ppp: (x, y, z) => new THREE.Vector3(x, y, z),
+  npp: (x, y, z) => new THREE.Vector3(-x, y, z),
+  pnp: (x, y, z) => new THREE.Vector3(x, -y, z),
+  ppn: (x, y, z) => new THREE.Vector3(x, y, -z),
+  nnp: (x, y, z) => new THREE.Vector3(-x, -y, z),
+  npn: (x, y, z) => new THREE.Vector3(-x, y, -z),
+  pnn: (x, y, z) => new THREE.Vector3(x, -y, -z),
+  nnn: (x, y, z) => new THREE.Vector3(-x, -y, -z),
+};
+const POSE_AXIS_MODE = "pnn";
+function bodyPointToYUp(pt) {
+  const [x, y, z] = pt;
+  return AXIS_SIGN_MODES[POSE_AXIS_MODE](x, y, z);
+}
+
+const ARM_FORWARD_LIFT = 0.18;
+const ARM_LATERAL_SCALE = 0.651; // avatarShoulderWidth / realShoulderWidth, measured
+
+function applyPose(bodyFrame) {
+  if (!bodyFrame || !bodyFrame.landmarks_world || !armRest) return false;
+  const raw = bodyFrame.landmarks_world;
+  let anyApplied = false;
+  for (const { bone: boneName, fromIdx, toIdx } of ARM_CHAIN) {
+    const rest = armRest[boneName];
+    const bone = getBone(boneName);
+    if (!rest || !bone) continue;
+    const fromPt = raw[fromIdx], toPt = raw[toIdx];
+    if (!fromPt || !toPt) continue;
+    const a = bodyPointToYUp(fromPt), b = bodyPointToYUp(toPt);
+    const diff = b.clone().sub(a);
+    diff.x *= ARM_LATERAL_SCALE;
+    const observedDir = diff.normalize();
+    // (2026-10-05, AK: "DH can use a little more lift") Arms reaching toward the
+    // camera read lower on screen than in the recording; tilt forward-pointing
+    // segments up a little. Zero for arms hanging/pointing sideways or down.
+    observedDir.y += ARM_FORWARD_LIFT * Math.max(0, observedDir.z);
+    observedDir.normalize();
+    if (observedDir.lengthSq() < 1e-8) continue;
+    const delta = new THREE.Quaternion().setFromUnitVectors(rest.worldDir, observedDir);
+    const newWorldQuat = delta.clone().multiply(rest.worldQuat);
+    const parent = bone.parent;
+    const parentWorldQuat = new THREE.Quaternion();
+    if (parent) parent.getWorldQuaternion(parentWorldQuat);
+    const localQuat = parentWorldQuat.clone().invert().multiply(newWorldQuat);
+    bone.quaternion.copy(localQuat);
+    bone.updateMatrixWorld(true);
+    anyApplied = true;
+  }
+  return anyApplied;
+}
+
+function headCorrectionQuat() { return new THREE.Quaternion(); } // "none" mode, matches production
+function applyHead(faceFrame) {
+  if (!faceFrame || !faceFrame.transform) return false;
+  const m = faceFrame.transform;
+  const colMajor = [
+    m[0], m[4], m[8], m[12],
+    m[1], m[5], m[9], m[13],
+    m[2], m[6], m[10], m[14],
+    m[3], m[7], m[11], m[15],
+  ];
+  const mat = new THREE.Matrix4().fromArray(colMajor);
+  const pos = new THREE.Vector3(), quat = new THREE.Quaternion(), scl = new THREE.Vector3();
+  mat.decompose(pos, quat, scl);
+  quat.premultiply(headCorrectionQuat());
+  const head = getBone("head");
+  if (head) head.quaternion.copy(quat);
+  return true;
+}
+
+const EXPR_MAP = [
+  ["jawOpen", "aa", 1.0],
+  ["mouthPucker", "ou", 1.3],
+  ["mouthFunnel", "oh", 0.8],
+  ["mouthSmileLeft", "happy", 0.5],
+  ["mouthSmileRight", "happy", 0.5],
+  ["eyeBlinkLeft", "blinkLeft", 1.0],
+  ["eyeBlinkRight", "blinkRight", 1.0],
+  ["browInnerUp", "surprised", 0.6],
+];
+function applyFace(faceFrame) {
+  if (!faceFrame || !faceFrame.blendshapes || !vrm.expressionManager) return false;
+  const bs = faceFrame.blendshapes;
+  const em = vrm.expressionManager;
+  for (const name of em.expressions.map((e) => e.expressionName)) em.setValue(name, 0);
+  for (const [bsName, exprName, scale] of EXPR_MAP) {
+    const v = bs[bsName];
+    if (v == null) continue;
+    const cur = em.getValue(exprName) || 0;
+    em.setValue(exprName, Math.min(1, cur + v * scale));
+  }
+  return true;
+}
+
+// --- General geometric clearance system (verbatim, see gold_review.html / --
+// --- index.html for the full history of why this replaced the old per-   --
+// --- reference-point nudges) ----------------------------------------------
+const CLOTHING_CLEARANCE_MARGIN = 0.02;
+let clothingClearanceBox = null;
+function computeClothingClearanceBox() {
+  let box = null;
+  vrm.scene.traverse((obj) => {
+    if (obj.name === "Body_2" || obj.name === "Body_4") {
+      obj.geometry.computeBoundingBox();
+      const bb = obj.geometry.boundingBox.clone();
+      bb.applyMatrix4(obj.matrixWorld);
+      if (!box) box = bb.clone();
+      else box.union(bb);
+    }
+  });
+  clothingClearanceBox = box;
+}
+
+function pushBoneToWorldZ(rawBone, targetWorldZ) {
+  rawBone.updateMatrixWorld(true);
+  const worldPos = new THREE.Vector3();
+  rawBone.getWorldPosition(worldPos);
+  if (worldPos.z >= targetWorldZ) return;
+  const neededDeltaZ = targetWorldZ - worldPos.z;
+  const parent = rawBone.parent;
+  const parentWorldQuat = new THREE.Quaternion();
+  if (parent) parent.getWorldQuaternion(parentWorldQuat);
+  const localDelta = new THREE.Vector3(0, 0, neededDeltaZ)
+    .applyQuaternion(parentWorldQuat.clone().invert());
+  rawBone.position.add(localDelta);
+  rawBone.updateMatrixWorld(true);
+}
+
+function clearClothingBox(rawBone, weight = 1) {
+  if (!clothingClearanceBox) return;
+  rawBone.updateMatrixWorld(true);
+  const worldPos = new THREE.Vector3();
+  rawBone.getWorldPosition(worldPos);
+  const box = clothingClearanceBox;
+  const insideXY = worldPos.x > box.min.x && worldPos.x < box.max.x &&
+                   worldPos.y > box.min.y && worldPos.y < box.max.y;
+  if (!insideXY) return;
+  const target = box.max.z + CLOTHING_CLEARANCE_MARGIN;
+  // weight < 1 pushes only part of the way (used to ease off the shoulder push)
+  pushBoneToWorldZ(rawBone, worldPos.z >= target ? worldPos.z : worldPos.z + (target - worldPos.z) * weight);
+}
+// (2026-10-05) The shoulder joint used to be pushed to the shirt's front surface
+// (~17.7 cm toward the camera) on EVERY gesture frame, translating the whole arm
+// forward even when the arm was already in front of the torso (e.g. hand raised
+// to the head, as in "A"), which stretched the shoulder and made forearms look
+// too steep/low. Now the shoulder is pushed only by the least amount that gets
+// the elbow and hand clear of the shirt: unchanged for arms hanging at the sides
+// (elbow behind the shirt front), none for arms already reaching forward or held
+// above the shirt.
+function shoulderPushAmount(elbowRaw, handRaw) {
+  if (!clothingClearanceBox) return 0;
+  const box = clothingClearanceBox;
+  const target = box.max.z + CLOTHING_CLEARANCE_MARGIN;
+  let need = 0;
+  const p = new THREE.Vector3();
+  for (const b of [elbowRaw, handRaw]) {
+    if (!b) continue;
+    b.updateMatrixWorld(true);
+    b.getWorldPosition(p);
+    // soft box edges (0.06 m) so the push eases in/out instead of snapping
+    const wx = smooth01((p.x - box.min.x) / 0.06) * smooth01((box.max.x - p.x) / 0.06);
+    const wy = smooth01((p.y - box.min.y) / 0.06) * smooth01((box.max.y - p.y) / 0.06);
+    if (p.z < target) need = Math.max(need, (target - p.z) * wx * wy);
+  }
+  return need;
+}
+
+const HAND_HEAD_FRONT_RADIUS = 0.30, HAND_HEAD_FRONT_Z = 0.24;
+const HAND_HEAD_FORWARD_OFFSET = 0.16;
+const HAND_HEAD_CLEARANCE_RADIUS = 0.30;
+// Keep the elbow/forearm in front of the hair's side locks when the arm is
+// raised beside/over the head (2026-10-05, AK: "A" NDH forearm vanished behind hair).
+const HEAD_ELBOW_FRONT_Z = 0.20;
+function smooth01(t) { t = Math.min(1, Math.max(0, t)); return t * t * (3 - 2 * t); }
+function clearHeadFront(rawBone, frontZ) {
+  const head = getBone("head");
+  if (!head) return;
+  rawBone.updateMatrixWorld(true);
+  const p = new THREE.Vector3(); rawBone.getWorldPosition(p);
+  const h = new THREE.Vector3(); head.getWorldPosition(h);
+  const w = smooth01((0.30 - Math.abs(p.x - h.x)) / 0.08) * smooth01((p.y - (h.y - 0.22)) / 0.10);
+  const tz = h.z + frontZ;
+  if (w > 0 && p.z < tz) {
+    pushBoneToWorldZ(rawBone, p.z + (tz - p.z) * w);
+    rawBone.updateMatrixWorld(true);
+  }
+}
+function clearHeadVolume(rawBone) {
+  const head = getBone("head");
+  if (!head) return;
+  rawBone.updateMatrixWorld(true);
+  const worldPos = new THREE.Vector3();
+  rawBone.getWorldPosition(worldPos);
+  const headWorldPos = new THREE.Vector3();
+  head.getWorldPosition(headWorldPos);
+  const d = worldPos.distanceTo(headWorldPos);
+  // (2026-10-05) A hand over/near the head must stay in FRONT of the hair, not
+  // vanish behind it: floor its z at the head's front surface.
+  const dxy = Math.hypot(worldPos.x - headWorldPos.x, worldPos.y - headWorldPos.y);
+  const wR = smooth01((HAND_HEAD_FRONT_RADIUS - dxy) / 0.08);            // soft edge: no on/off toggling
+  const wY = smooth01((worldPos.y - (headWorldPos.y - 0.18)) / 0.10);
+  const wFront = wR * wY;
+  const frontZ = headWorldPos.z + HAND_HEAD_FRONT_Z;
+  if (wFront > 0 && worldPos.z < frontZ) {
+    pushBoneToWorldZ(rawBone, worldPos.z + (frontZ - worldPos.z) * wFront);
+    rawBone.updateMatrixWorld(true);
+    rawBone.getWorldPosition(worldPos);
+  }
+  const t = THREE.MathUtils.clamp(1 - d / HAND_HEAD_CLEARANCE_RADIUS, 0, 1);
+  if (t <= 0) return;
+  const offset = HAND_HEAD_FORWARD_OFFSET * t;
+  const parent = rawBone.parent;
+  const parentWorldQuat = new THREE.Quaternion();
+  if (parent) parent.getWorldQuaternion(parentWorldQuat);
+  const localDelta = new THREE.Vector3(0, 0, offset)
+    .applyQuaternion(parentWorldQuat.clone().invert());
+  rawBone.position.add(localDelta);
+  rawBone.updateMatrixWorld(true);
+}
+
+const MIN_HAND_SEPARATION = 0.075;
+function applyHandSeparation() {
+  const leftRaw = vrm.humanoid.getRawBoneNode("leftHand");
+  const rightRaw = vrm.humanoid.getRawBoneNode("rightHand");
+  if (!leftRaw || !rightRaw) return;
+  leftRaw.updateMatrixWorld(true);
+  rightRaw.updateMatrixWorld(true);
+  const leftPos = new THREE.Vector3(); leftRaw.getWorldPosition(leftPos);
+  const rightPos = new THREE.Vector3(); rightRaw.getWorldPosition(rightPos);
+  const diff = leftPos.clone().sub(rightPos);
+  const dist = diff.length();
+  if (dist >= MIN_HAND_SEPARATION || dist < 1e-6) return;
+  const push = (MIN_HAND_SEPARATION - dist) / 2;
+  const dir = diff.normalize();
+  const applyPush = (rawBone, worldDir) => {
+    const parent = rawBone.parent;
+    const parentWorldQuat = new THREE.Quaternion();
+    if (parent) parent.getWorldQuaternion(parentWorldQuat);
+    const localDelta = worldDir.clone().multiplyScalar(push)
+      .applyQuaternion(parentWorldQuat.clone().invert());
+    rawBone.position.add(localDelta);
+    rawBone.updateMatrixWorld(true);
+  };
+  applyPush(leftRaw, dir);
+  applyPush(rightRaw, dir.clone().negate());
+}
+
+let handRestLocalPos = { Left: null, Right: null };
+let lowerArmRestLocalPos = { Left: null, Right: null };
+let upperArmRestLocalPos = { Left: null, Right: null };
+function applyPositionClearance(side) {
+  const upperArm = vrm.humanoid.getRawBoneNode(side.toLowerCase() + "UpperArm");
+  const lowerArm = vrm.humanoid.getRawBoneNode(side.toLowerCase() + "LowerArm");
+  const hand = vrm.humanoid.getRawBoneNode(side.toLowerCase() + "Hand");
+  if (upperArm && upperArmRestLocalPos[side]) {
+    upperArm.position.copy(upperArmRestLocalPos[side]);
+    if (lowerArm && lowerArmRestLocalPos[side]) lowerArm.position.copy(lowerArmRestLocalPos[side]);
+    if (hand && handRestLocalPos[side]) hand.position.copy(handRestLocalPos[side]);
+    upperArm.updateMatrixWorld(true);
+    const shoulderNeed = shoulderPushAmount(lowerArm, hand);
+    if (shoulderNeed > 0) {
+      const sp = new THREE.Vector3(); upperArm.getWorldPosition(sp);
+      pushBoneToWorldZ(upperArm, sp.z + shoulderNeed);
+    }
+  }
+  if (lowerArm && lowerArmRestLocalPos[side]) {
+    lowerArm.position.copy(lowerArmRestLocalPos[side]);
+    clearClothingBox(lowerArm);
+    clearHeadFront(lowerArm, HEAD_ELBOW_FRONT_Z);
+  }
+  if (hand && handRestLocalPos[side]) {
+    hand.position.copy(handRestLocalPos[side]);
+    clearClothingBox(hand);
+    clearHeadVolume(hand);
+  }
+}
+
+// Library-aware hand-source mapping (verbatim from gold_review.html) -- see
+// that file's comment for why dh_library/ndh_library/head_library each need
+// a different landmarks->bone mapping.
+function getHandSources(lib, e) {
+  if (lib === "ndh_library") return { right: e.incidental_opposite_landmarks || null, left: e.landmarks || null };
+  if (lib === "head_library") return { right: e.incidental_dh_landmarks || null, left: e.incidental_ndh_landmarks || null };
+  return { right: e.landmarks || null, left: e.incidental_opposite_landmarks || null }; // dh_library (and default)
+}
+
+// --- Idle liveliness layer (2026-10-04, AK: add blink/breathing/"3d feel"
+// without changing the avatar's appearance; verbatim from index.html) ----
+// Three effects, all driven by wall-clock time (not gesture-frame index)
+// so they keep animating whether a gesture is actively playing or the
+// avatar is just sitting idle between words/sentences -- this page in
+// particular has no entry loaded at all until the first sentence is
+// submitted, so the heartbeat path below is what keeps it alive on load:
+//   1. Blink: this model exposes a standalone "blink" expression, separate
+//      from "blinkLeft"/"blinkRight" (which applyFace() drives from the
+//      signer's own captured face data) -- using the separate channel
+//      means idle blinking never fights with real per-gesture blink data.
+//   2. Breathing: a small rotation on the "chest" bone. Confirmed nothing
+//      else in this file ever touches "chest" (ARM_CHAIN only drives the
+//      arm bones; body pose isn't wired to any torso bone), so this owns
+//      it outright with zero contention.
+//   3. Gaze drift: uses three-vrm's built-in VRMLookAt (this model has
+//      leftEye/rightEye bones + an autoUpdate VRMLookAt instance already),
+//      pointed at a small invisible target placed roughly where the
+//      camera is -- so the resting gaze reads as "looking at the viewer" --
+//      with a slow natural saccade-and-hold wander on top, rather than a
+//      continuous mechanical sweep.
+// Applied from two call sites that never run in the same tick (see
+// idleHeartbeatTick()'s comment for why that's safe): inside setFrame(),
+// so it rides along with every real gesture-frame render; and from a
+// standalone heartbeat loop that only acts when setFrame() hasn't run
+// recently, so the idle layer still animates even before any word has
+// ever been played.
+let idleBlinkNextAt = 0;
+let idleBlinking = false;
+let idleBlinkElapsed = 0; // ms progressed within the current blink
+let idleBlinkLastT = null;
+const IDLE_BLINK_CLOSE_MS = 90, IDLE_BLINK_HOLD_MS = 40, IDLE_BLINK_OPEN_MS = 130;
+const IDLE_BLINK_TOTAL_MS = IDLE_BLINK_CLOSE_MS + IDLE_BLINK_HOLD_MS + IDLE_BLINK_OPEN_MS;
+// Progress is advanced by a STEP CAPPED AT 40ms per call, not the raw gap
+// between calls -- found during testing that this matters: a ~260ms blink
+// pulse evaluated against raw wall-clock deltas can fall entirely inside a
+// single gap between two ticks (confirmed happening under this sandbox's
+// known headless rAF throttling, see project notes) and never show up at
+// all. Capping the per-call step means a slow tick just plays the blink in
+// slow motion instead of skipping it outright -- same fix shape as the
+// clamped head-distance blends elsewhere in this file, applied to time
+// instead of distance.
+function idleBlinkValue(tMs) {
+  if (!idleBlinking) {
+    if (tMs < idleBlinkNextAt) return 0;
+    idleBlinking = true;
+    idleBlinkElapsed = 0;
+    idleBlinkLastT = tMs;
+  }
+  idleBlinkElapsed += Math.min(40, Math.max(0, tMs - idleBlinkLastT));
+  idleBlinkLastT = tMs;
+  const holdEnd = IDLE_BLINK_CLOSE_MS + IDLE_BLINK_HOLD_MS;
+  let v;
+  if (idleBlinkElapsed < IDLE_BLINK_CLOSE_MS) v = idleBlinkElapsed / IDLE_BLINK_CLOSE_MS;
+  else if (idleBlinkElapsed < holdEnd) v = 1;
+  else if (idleBlinkElapsed < IDLE_BLINK_TOTAL_MS) v = 1 - (idleBlinkElapsed - holdEnd) / IDLE_BLINK_OPEN_MS;
+  else {
+    v = 0;
+    idleBlinking = false;
+    idleBlinkLastT = null;
+    idleBlinkNextAt = tMs + 2500 + Math.random() * 3000; // next blink in 2.5-5.5s
+  }
+  return Math.max(0, Math.min(1, v));
+}
+
+let chestRestQuat = null;
+const BREATH_PERIOD_MS = 4200; // ~14 breaths/min, calm resting rate
+const BREATH_AMPLITUDE = 0.045; // radians (~2.6 degrees) -- subtle on purpose
+function applyBreathing(tMs) {
+  const chest = getBone("chest");
+  if (!chest) return;
+  if (!chestRestQuat) chestRestQuat = chest.quaternion.clone();
+  const phase = ((tMs % BREATH_PERIOD_MS) / BREATH_PERIOD_MS) * Math.PI * 2;
+  const lift = Math.sin(phase) * BREATH_AMPLITUDE;
+  const breathQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(-lift * 0.6, 0, lift * 0.25));
+  chest.quaternion.copy(chestRestQuat).multiply(breathQuat);
+}
+
+let gazeTarget = null;
+let gazeCurrentOffset = { x: 0, y: 0 };
+let gazeTargetOffset = { x: 0, y: 0 };
+let gazeSaccadeFromOffset = { x: 0, y: 0 };
+let gazeNextSaccadeAt = 0;
+let gazeSaccadeStartedAt = -1;
+const GAZE_SACCADE_MS = 220;
+const GAZE_CONE = 0.09; // meters of wander at the gaze target's distance
+function setupGazeTarget() {
+  const head = getBone("head");
+  if (!head || !vrm.lookAt) return;
+  const headPos = new THREE.Vector3();
+  head.getWorldPosition(headPos);
+  gazeTarget = new THREE.Object3D();
+  gazeTarget.position.set(headPos.x, headPos.y, headPos.z + 1.6); // roughly camera distance, dead ahead
+  scene.add(gazeTarget);
+  vrm.lookAt.target = gazeTarget;
+}
+function applyGazeDrift(tMs) {
+  if (!gazeTarget) return;
+  if (tMs >= gazeNextSaccadeAt && gazeSaccadeStartedAt < 0) {
+    gazeSaccadeStartedAt = tMs;
+    gazeSaccadeFromOffset = { ...gazeCurrentOffset };
+    gazeTargetOffset = {
+      x: (Math.random() * 2 - 1) * GAZE_CONE,
+      y: (Math.random() * 2 - 1) * GAZE_CONE * 0.6, // eyes wander less vertically
+    };
+  }
+  if (gazeSaccadeStartedAt >= 0) {
+    const t = Math.min(1, (tMs - gazeSaccadeStartedAt) / GAZE_SACCADE_MS);
+    const eased = t * (2 - t); // ease-out
+    gazeCurrentOffset = {
+      x: gazeSaccadeFromOffset.x + (gazeTargetOffset.x - gazeSaccadeFromOffset.x) * eased,
+      y: gazeSaccadeFromOffset.y + (gazeTargetOffset.y - gazeSaccadeFromOffset.y) * eased,
+    };
+    if (t >= 1) {
+      gazeSaccadeStartedAt = -1;
+      gazeNextSaccadeAt = tMs + 1200 + Math.random() * 2800; // next saccade in 1.2-4s
+    }
+  }
+  const head = getBone("head");
+  if (!head) return;
+  const headPos = new THREE.Vector3();
+  head.getWorldPosition(headPos);
+  gazeTarget.position.set(headPos.x + gazeCurrentOffset.x, headPos.y + gazeCurrentOffset.y, headPos.z + 1.6);
+}
+
+const idleStartTime = performance.now();
+function applyIdleLayer(tMs) {
+  if (vrm.expressionManager) vrm.expressionManager.setValue("blink", idleBlinkValue(tMs));
+  applyBreathing(tMs);
+  applyGazeDrift(tMs);
+}
+
+// vrm.update(delta) also drives three-vrm's own spring-bone (cloth/hair
+// jiggle) physics, which integrates using whatever delta it's given -- it
+// has no way to know real time from a hardcoded number. Every call site
+// here used to pass a fixed 0.016 (an assumed 60fps frame), which is fine
+// when ticks genuinely arrive every ~16ms, but badly wrong whenever they
+// don't (a slow/busy tab, a throttled background tab, heavy scene
+// complexity): the spring-bone solver then "thinks" far less wall-clock
+// time has passed than really has, and visibly lags behind the skeleton's
+// actual pose -- e.g. a sleeve appearing to hang in the last gesture's
+// position for a long stretch after the rest-pose restore has already
+// instantly reset every real skeleton bone underneath it (confirmed by
+// direct bone inspection: position+rotation matched the fresh-load rest
+// values exactly, even while the rendered sleeve still looked wrong).
+// Computing the real elapsed time each call keeps the physics in sync
+// with wall-clock time regardless of how fast ticks actually arrive.
+// Clamped so a long gap (e.g. the tab was backgrounded) doesn't feed the
+// solver one huge delta and make cloth/hair jump or overshoot.
+let lastVrmUpdateAt = performance.now();
+function vrmUpdateRealDelta() {
+  const now = performance.now();
+  const dt = Math.min(0.1, Math.max(0, (now - lastVrmUpdateAt) / 1000));
+  lastVrmUpdateAt = now;
+  vrm.update(dt);
+}
+
+// --- Rest-pose restore (2026-10-04, AK: avatar should sit at its natural
+// rest pose on load, and return to it after a gesture/sentence finishes --
+// not T-pose, and not frozen holding the last handshape; see index.html's
+// comment for the full root-cause story) -----------------------------------
+// Short version: three-vrm's normalized bone proxies start at IDENTITY
+// rotation (= T-pose) until something explicitly poses them, and
+// vrm.update() unconditionally syncs that onto the raw skeleton -- so the
+// idle heartbeat's first vrm.update() call was overwriting the nice
+// authored rest pose with T-pose. Capturing the raw skeleton's rotation
+// right after load does NOT dodge this either (confirmed by direct
+// inspection: it's already T-pose-ish by then, an artifact of three-vrm's
+// own humanoid setup, not the GLB's real bind pose). Unlike index.html /
+// gold_review.html, this page has no default word auto-loaded to borrow a
+// known-good pose from, so captureRestPoseRawQuats() here fetches one gold
+// word's first frame purely as a rest-pose reference (not touching the
+// real `entry`/`curLibrary` playback state), poses it once, and captures
+// the result. Excludes "chest" (breathing) and the eye bones (gaze drift).
+const REST_POSE_BONE_NAMES = [
+  "hips", "spine", "upperChest", "neck", "head",
+  "leftShoulder", "leftUpperArm", "leftLowerArm", "leftHand",
+  "leftThumbMetacarpal", "leftThumbProximal", "leftThumbDistal",
+  "leftIndexProximal", "leftIndexIntermediate", "leftIndexDistal",
+  "leftMiddleProximal", "leftMiddleIntermediate", "leftMiddleDistal",
+  "leftRingProximal", "leftRingIntermediate", "leftRingDistal",
+  "leftLittleProximal", "leftLittleIntermediate", "leftLittleDistal",
+  "rightShoulder", "rightUpperArm", "rightLowerArm", "rightHand",
+  "rightThumbMetacarpal", "rightThumbProximal", "rightThumbDistal",
+  "rightIndexProximal", "rightIndexIntermediate", "rightIndexDistal",
+  "rightMiddleProximal", "rightMiddleIntermediate", "rightMiddleDistal",
+  "rightRingProximal", "rightRingIntermediate", "rightRingDistal",
+  "rightLittleProximal", "rightLittleIntermediate", "rightLittleDistal",
+  "leftUpperLeg", "leftLowerLeg", "leftFoot", "leftToes",
+  "rightUpperLeg", "rightLowerLeg", "rightFoot", "rightToes",
+];
+let restPoseRawQuat = null;
+// Reference pose source: index.html/gold_review.html derive "rest" from
+// their own default entry's frame 0 ("I", via /data/entry_I.json), which
+// was visually verified to be a clean neutral stance (arms relaxed, one
+// hand on hip -- see restpose_3_afterpause.png from that verification).
+// This page originally re-derived its own "I" reference by going through
+// the gold-pick lookup chain (api/gold/summary -> api/gold/instance), but
+// that gold-marked recording for "I" turned out to be a DIFFERENT capture
+// (different signer/session/utterance than entry_I.json) whose first frame
+// starts mid-gesture, not neutral -- confirmed by screenshot, the arm sat
+// raised near the shoulder instead of relaxed at the side. Since all three
+// pages share the exact same VRM rig, "rest" should be the same pose
+// everywhere regardless of which word is on screen, so this just fetches
+// the same already-verified-good entry_I.json directly instead of
+// re-deriving its own (worse) reference.
+
+
+// --- Hand dropout fill + relaxed hand (2026-10-05, AK review round 2) --------
+// (a) MediaPipe loses the hand for a few frames when it is occluded (e.g. a fist
+// at the forehead). applyHand() then keeps the last valid orientation while the
+// arm keeps moving, so the hand lags/looks wrong ("DH needs more lift", frame
+// 4335: 5-frame dropout). Short gaps (<= HAND_GAP_MAX frames) that have valid
+// frames on BOTH sides are filled by linear interpolation of the 21 landmarks.
+// Leading/trailing gaps and long gaps are left alone (hold-last, as before).
+const HAND_GAP_MAX = 8;
+function fillEntryHandGaps(e) {
+  if (!e || e.__handGapsFilled) return e;
+  e.__handGapsFilled = true;
+  for (const key of ["landmarks", "incidental_opposite_landmarks"]) {
+    const arr = e[key];
+    if (!arr) continue;
+    // (2026-10-05, AK: "WHY" DH fingers bend the wrong way for a moment) A hand
+    // pointing at the camera collapses in the recorded landmarks (wrist->middle-
+    // knuckle length drops to ~45% for 1-2 frames) and the palm frame flips with
+    // it. Treat such brief collapses (<= 3 frames) as dropouts and interpolate;
+    // sustained foreshortened poses are left alone.
+    {
+      const len = arr.map(h => (h && h.length >= 21) ? Math.hypot(h[9][0] - h[0][0], h[9][1] - h[0][1], h[9][2] - h[0][2]) : 0);
+      const bad = len.map((l, i) => {
+        if (!l) return false;
+        const win = [];
+        for (let k = Math.max(0, i - 6); k <= Math.min(arr.length - 1, i + 6); k++) if (len[k]) win.push(len[k]);
+        win.sort((x, y) => x - y);
+        return win.length >= 5 && l < 0.72 * win[win.length >> 1];
+      });
+      let r = 0;
+      while (r < arr.length) {
+        if (!bad[r]) { r++; continue; }
+        let q = r; while (q < arr.length && bad[q]) q++;
+        if (q - r <= 3) for (let k = r; k < q; k++) arr[k] = null;
+        r = q;
+      }
+    }
+    // (2026-10-05, AK: "WHY" fingers bend the wrong way) Monocular hand landmarks
+    // sometimes come back depth-mirrored: all four fingers then curl toward the BACK
+    // of the hand, which is anatomically impossible. Measured over all 38 gold
+    // entries: DH finger curl (relative to the palm normal) is never strongly
+    // negative except in WHY (24% of frames) and WHO (4%); NDH has the opposite
+    // sign convention. For such frames reflect the finger/thumb points through the
+    // palm plane, so the curl goes toward the palm. Palm orientation is unchanged.
+    {
+      const sign = key === "landmarks" ? 1 : -1;   // DH = right hand, NDH = left hand
+      for (let f = 0; f < arr.length; f++) {
+        const h = arr[f];
+        if (!h || h.length < 21) continue;
+        const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        const nrm = (v) => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+        const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        const w = h[0];
+        const a = sub(h[5], w), b = sub(h[17], w);
+        const n = nrm([a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]);
+        let c = 0;
+        for (const [m, t] of [[5, 8], [9, 12], [13, 16], [17, 20]]) c += dot(n, nrm(sub(h[t], h[m])));
+        c = sign * c / 4;
+        if (c < -0.3) {
+          arr[f] = h.map((p, k) => {
+            if (k === 0 || k === 5 || k === 9 || k === 13 || k === 17) return p;
+            const d = 2 * dot(sub(p, w), n);
+            return [p[0] - d * n[0], p[1] - d * n[1], p[2] - d * n[2]];
+          });
+        }
+      }
+    }
+    let i = 0;
+    while (i < arr.length) {
+      if (arr[i]) { i++; continue; }
+      let j = i;
+      while (j < arr.length && !arr[j]) j++;
+      const a = i - 1, b = j;
+      if (a >= 0 && b < arr.length && (b - a - 1) <= HAND_GAP_MAX && arr[a].length === arr[b].length) {
+        const A = arr[a], B = arr[b];
+        for (let k = i; k < j; k++) {
+          const t = (k - a) / (b - a);
+          arr[k] = A.map((p, m) => [p[0] + (B[m][0] - p[0]) * t, p[1] + (B[m][1] - p[1]) * t, p[2] + (B[m][2] - p[2]) * t]);
+        }
+      }
+      i = j;
+    }
+  }
+  return e;
+}
+// (b) A hand that has NO landmark data anywhere in the clip (e.g. the resting NDH
+// in most one-handed signs) was never posed, so it kept a stale/identity wrist and
+// finger rotation -> twisted palm. Such a hand now takes the relaxed rest hand
+// (the DH rest hand, mirrored for the left), captured with the rest pose.
+const HAND_CHAIN_BONES = ["Hand", "ThumbMetacarpal", "ThumbProximal", "ThumbDistal",
+  "IndexProximal", "IndexIntermediate", "IndexDistal", "MiddleProximal", "MiddleIntermediate", "MiddleDistal",
+  "RingProximal", "RingIntermediate", "RingDistal", "LittleProximal", "LittleIntermediate", "LittleDistal"];
+let relaxedHand = { Left: null, Right: null };
+const _handDataCache = new WeakMap();
+function handHasData(arr) {
+  if (!arr) return false;
+  let v = _handDataCache.get(arr);
+  if (v === undefined) { v = arr.some(Boolean); _handDataCache.set(arr, v); }
+  return v;
+}
+function applyRelaxedHand(side) {
+  const set = relaxedHand[side];
+  if (!set) return;
+  const p = side.toLowerCase();
+  for (const n of HAND_CHAIN_BONES) {
+    const b = getBone(p + n);
+    if (b && set[n]) b.quaternion.copy(set[n]);
+  }
+  if (typeof lastHandLocalQuat !== "undefined") lastHandLocalQuat[side] = null;
+}
+
+
+// Neutral reference for the rest pose (the same recording sentence.html uses:
+// entry "I", frame 0 -- arms relaxed at the sides). index.html/gold_review.html
+// used to take their rest pose from whatever entry happened to load first.
+let neutralRefEntry = null;
+async function ensureNeutralRef() {
+  if (neutralRefEntry) return;
+  try {
+    const r = await fetch("/data/entry_I.json");
+    neutralRefEntry = fillEntryHandGaps(await r.json());
+  } catch (e) { console.warn("neutral rest reference fetch failed; using the current pose", e); }
+}
+function poseNeutralRef() {
+  const e = neutralRefEntry;
+  if (!e) return;
+  applyPose(e.body ? e.body[0] : null);
+  applyHand(e.landmarks ? e.landmarks[0] : null, "Right");
+  applyHead(e.face ? e.face[0] : null);
+}
+
+// --- Symmetric rest arms (2026-10-05, AK: "NDH longer than DH in rest pose") ---
+// The rest pose is captured from the recording's first frame, so each arm hangs
+// the way THAT signer's arm happened to hang (measured: NDH hand 5.4 cm lower
+// than DH, fingertips ~10 cm lower). The DH (right) arm is the natural-looking
+// one, so the left upper/lower arm are set to its mirror image (reflection across
+// the body's left-right plane: q -> (x, -y, -z, w); valid because normalized
+// VRM bones share one world-aligned rest frame). Rotation only; hands/fingers,
+// gesture playback and the arm retarget are untouched.
+function symmetrizeRestArms() {
+  poseNeutralRef();
+  for (const part of ["UpperArm", "LowerArm"]) {
+    const src = getBone("right" + part), dst = getBone("left" + part);
+    if (!src || !dst) continue;
+    const q = src.quaternion;
+    dst.quaternion.set(q.x, -q.y, -q.z, q.w);
+  }
+  // Hand + fingers too: the left (NDH) hand is mirrored from the right so an
+  // unposed NDH hand rests in a natural relaxed shape instead of a twisted one.
+  relaxedHand.Right = {}; relaxedHand.Left = {};
+  for (const n of HAND_CHAIN_BONES) {
+    const src = getBone("right" + n), dst = getBone("left" + n);
+    if (!src || !dst) continue;
+    const q = src.quaternion;
+    dst.quaternion.set(q.x, -q.y, -q.z, q.w);
+    relaxedHand.Right[n] = src.quaternion.clone();
+    relaxedHand.Left[n] = dst.quaternion.clone();
+  }
+  vrm.scene.updateMatrixWorld(true);
+}
+async function captureRestPoseRawQuats() {
+  try {
+    const res = await fetch("/data/entry_I.json");
+    const refEntry = await res.json();
+    const hands = getHandSources("dh_library", refEntry);
+    applyPose(refEntry.body ? refEntry.body[0] : null);
+    applyHand(hands.right ? hands.right[0] : null, "Right");
+    applyHand(hands.left ? hands.left[0] : null, "Left");
+    applyHead(refEntry.face ? refEntry.face[0] : null);
+    symmetrizeRestArms();
+    // Settle the spring-bone (sleeve/hair) physics into this new pose
+    // before capturing anything below -- a single vrm.update() tick only
+    // nudges them one small step away from wherever they WERE (the
+    // T-pose-ish bind state right after load), so capturing right after
+    // just one tick bakes in a still-mid-swing, flared-out configuration
+    // as "rest" (confirmed: that's exactly what happened the first time
+    // this used a single vrmUpdateRealDelta() call here -- the sleeves
+    // came out flared instead of hanging naturally). Simulating a few
+    // seconds of settling time up front, in small fixed steps so the
+    // integrator stays stable, gives the physics time to actually
+    // converge to a natural hang before anything treats this as "rest".
+    for (let i = 0; i < 150; i++) vrm.update(0.02);
+  } catch (e) {
+    console.warn("rest-pose reference fetch failed; falling back to whatever pose is currently on screen", e);
+  }
+  restPoseRawQuat = {};
+  for (const name of REST_POSE_BONE_NAMES) {
+    const b = vrm.humanoid.getRawBoneNode(name);
+    if (b) restPoseRawQuat[name] = b.quaternion.clone();
+  }
+  // The sleeve/hair spring-bone joints (VRMSpringBoneManager -- this model
+  // has 57, including J_Sec_R_TopsUpperArmInside/Outside for the sleeves)
+  // are NOT part of the humanoid skeleton, so nothing above touches them --
+  // they're purely physics-driven, chasing whatever their parent bone
+  // (e.g. rightUpperArm) does. three-vrm records each joint's "initial"
+  // local rotation exactly once, right after the model loads (while the
+  // skeleton is still in its T-pose-ish bind state), and that's the only
+  // state .reset() can snap back to. Left as-is, "resetting" a sleeve
+  // after a gesture only resets it to that original bind-relative
+  // orientation, not to how it looked under THIS rest pose -- and the
+  // physics sim has no guarantee of ever settling back to a sane
+  // configuration on its own (confirmed: a sleeve can stay visibly
+  // wrong for 60+ real seconds after the skeleton itself has already
+  // snapped back correctly). Capturing a fresh init state here, with the
+  // skeleton already posed to the real rest reference, means a later
+  // reset() snaps the sleeve back to exactly how it looks right now --
+  // i.e. the known-good rest pose.
+  if (vrm.springBoneManager) vrm.springBoneManager.setInitState();
+}
+// Eased return to rest (Polish pass, 2026-10-05): instead of snapping from the
+// last gesture pose to rest in one frame, beginRestBlend() records the current
+// raw pose and applyRestPose() eases from it to the rest pose over
+// REST_BLEND_MS. Cleared by setFrame() if playback restarts mid-return.
+const REST_BLEND_MS = 450;
+let restBlend = null;
+function beginRestBlend() {
+  if (!restPoseRawQuat || !vrm) return;
+  const q = {}, pos = {};
+  for (const name of REST_POSE_BONE_NAMES) {
+    const b = vrm.humanoid.getRawBoneNode(name);
+    if (b) q[name] = b.quaternion.clone();
+  }
+  for (const side of ["Left", "Right"]) {
+    for (const part of ["UpperArm", "LowerArm", "Hand"]) {
+      const b = vrm.humanoid.getRawBoneNode(side.toLowerCase() + part);
+      if (b) pos[side + part] = b.position.clone();
+    }
+  }
+  restBlend = { q, pos, t0: performance.now() };
+}
+function applyRestPose() {
+  if (!restPoseRawQuat) return;
+  let w = 1;
+  if (restBlend) {
+    const t = Math.min(1, (performance.now() - restBlend.t0) / REST_BLEND_MS);
+    w = t * t * (3 - 2 * t);
+    if (t >= 1) restBlend = null;
+  }
+  const blending = restBlend && w < 1;
+  for (const name of REST_POSE_BONE_NAMES) {
+    const q = restPoseRawQuat[name];
+    const b = q && vrm.humanoid.getRawBoneNode(name);
+    if (!b) continue;
+    if (blending && restBlend.q[name]) b.quaternion.copy(restBlend.q[name]).slerp(q, w);
+    else b.quaternion.copy(q);
+  }
+  const setPos = (bone, key, restPos) => {
+    if (!bone || !restPos) return;
+    if (blending && restBlend.pos[key]) bone.position.copy(restBlend.pos[key]).lerp(restPos, w);
+    else bone.position.copy(restPos);
+  };
+  for (const side of ["Left", "Right"]) {
+    const s = side.toLowerCase();
+    setPos(vrm.humanoid.getRawBoneNode(s + "UpperArm"), side + "UpperArm", upperArmRestLocalPos[side]);
+    setPos(vrm.humanoid.getRawBoneNode(s + "LowerArm"), side + "LowerArm", lowerArmRestLocalPos[side]);
+    setPos(vrm.humanoid.getRawBoneNode(s + "Hand"), side + "Hand", handRestLocalPos[side]);
+  }
+  // The sleeve spring joints' actual parent isn't the humanoid arm bone
+  // directly -- it's an aim-constraint bone (VRMNodeConstraintManager,
+  // e.g. "J_Aim_R_TopsUpperArm") that TRACKS rightUpperArm's rotation.
+  // Writing rightUpperArm's quaternion above doesn't move that constraint
+  // bone by itself; nothing recomputes it until the constraint system
+  // runs. Confirmed by direct inspection: after a reset, the spring
+  // joint's own local quaternion matched the captured rest value exactly,
+  // but its world-space tail position still didn't, because its parent
+  // (the constraint bone) hadn't been told the arm moved. Re-running the
+  // constraint pass now -- it reads the arm's local quaternion directly,
+  // not matrixWorld, so this is safe to call before the matrix update
+  // below -- brings the constraint bone back in sync with the just-reset
+  // arm.
+  if (vrm.nodeConstraintManager) vrm.nodeConstraintManager.update();
+  // Spring-bone reset() reads each joint's PARENT world matrix live (e.g.
+  // the aim-constraint bone's matrixWorld, for the sleeve joints) to work
+  // out where it should end up -- but nothing above has recomputed that
+  // matrix yet, so without a forced update here it's still whatever it
+  // was at the end of the LAST render (i.e. the just-finished gesture's
+  // pose, not the rotations just written above). That stale-parent-matrix
+  // read is what was making reset() snap sleeves to the wrong place even
+  // once the captured init state itself was correct. Forcing the world
+  // matrices to recompute now, before reset() reads them, is what
+  // actually fixes it.
+  vrm.scene.updateMatrixWorld(true);
+  // Snap the sleeve/hair spring bones back to the rest-pose init state
+  // captured above, instead of leaving them to (maybe never) physically
+  // settle there on their own -- see the comment in
+  // captureRestPoseRawQuats() for why a plain .reset() wasn't enough on
+  // its own without first re-capturing the init state.
+  if (vrm.springBoneManager) vrm.springBoneManager.reset();
+}
+// true whenever nothing is actively playing; setFrame() flips it false,
+// playback-completion points (stopPlayback()/playQueue()'s end) flip it
+// back to true. Starts true, but nothing shows rest until
+// captureRestPoseRawQuats() has resolved (entry stays null/untouched
+// until then, so there's nothing to look wrong in the meantime).
+let showRestPose = true;
+
+// Heartbeat: only acts when setFrame() hasn't rendered in the last 50ms --
+// i.e. only during genuine idle stretches (before the first word is ever
+// played, or between words/sentences). The moment real playback resumes,
+// setFrame() marks window.__lastSetFrameAt itself and this backs off, so
+// only one code path is ever driving vrm.update()/render() at a time --
+// no dual-loop race, no flicker.
+function idleHeartbeatTick() {
+  const now = performance.now();
+  if (now - (window.__lastSetFrameAt || 0) > 50) {
+    applyIdleLayer(now - idleStartTime);
+    vrmUpdateRealDelta();
+    if (showRestPose) applyRestPose();
+    renderer.render(scene, camera);
+    requestAnimationFrame(idleHeartbeatTick);
+  } else {
+    // Actively playing right now, so this tick has nothing to do -- but
+    // re-registering via requestAnimationFrame anyway would still claim a
+    // rAF slot every single frame, competing with playEntryFrames()'s own
+    // rAF loop for the browser's per-frame rAF budget purely for the sake
+    // of an empty no-op. Back off to an infrequent timer check instead
+    // while playback owns the frame; resume the tight rAF loop the moment
+    // we're idle again.
+    setTimeout(idleHeartbeatTick, 100);
+  }
+}
+
+window.setFrame = function (i) {
+  if (!entry) return;
+  window.__lastSetFrameAt = performance.now();
+  showRestPose = false;
+  restBlend = null;
+  const n = entry.frame_ids.length;
+  const idx = Math.max(0, Math.min(n - 1, i));
+  const hands = getHandSources(curLibrary, entry);
+  applyPose(entry.body ? entry.body[idx] : null);
+  applyHand(hands.right ? hands.right[idx] : null, "Right");
+  applyHand(hands.left ? hands.left[idx] : null, "Left");
+  if (!handHasData(hands.left)) applyRelaxedHand("Left");
+  if (!handHasData(hands.right)) applyRelaxedHand("Right");
+  applyHead(entry.face ? entry.face[idx] : null);
+  applyFace(entry.face ? entry.face[idx] : null);
+  applyTransitionBlend();
+  applyIdleLayer(performance.now() - idleStartTime);
+  vrmUpdateRealDelta();
+  applyPositionClearance("Left");
+  applyPositionClearance("Right");
+  applyHandSeparation();
+  renderer.render(scene, camera);
+};
+
+async function initVrm() {
+  const gltf = await loader.loadAsync("/models/sample.vrm");
+  vrm = gltf.userData.vrm;
+  VRMUtils.rotateVRM0(vrm);
+  scene.add(vrm.scene);
+  captureArmRest();
+  captureHandRest();
+  computeClothingClearanceBox();
+  const leftHandRawBone = vrm.humanoid.getRawBoneNode("leftHand");
+  if (leftHandRawBone) handRestLocalPos.Left = leftHandRawBone.position.clone();
+  const rightHandRawBone = vrm.humanoid.getRawBoneNode("rightHand");
+  if (rightHandRawBone) handRestLocalPos.Right = rightHandRawBone.position.clone();
+  const leftLowerArmRawBone = vrm.humanoid.getRawBoneNode("leftLowerArm");
+  if (leftLowerArmRawBone) lowerArmRestLocalPos.Left = leftLowerArmRawBone.position.clone();
+  const rightLowerArmRawBone = vrm.humanoid.getRawBoneNode("rightLowerArm");
+  if (rightLowerArmRawBone) lowerArmRestLocalPos.Right = rightLowerArmRawBone.position.clone();
+  const leftUpperArmRawBone = vrm.humanoid.getRawBoneNode("leftUpperArm");
+  if (leftUpperArmRawBone) upperArmRestLocalPos.Left = leftUpperArmRawBone.position.clone();
+  const rightUpperArmRawBone = vrm.humanoid.getRawBoneNode("rightUpperArm");
+  if (rightUpperArmRawBone) upperArmRestLocalPos.Right = rightUpperArmRawBone.position.clone();
+  setupGazeTarget();
+  // Captured HERE (after posing a reference word's first frame), not
+  // right after model load -- see the "Rest-pose restore" comment above
+  // for why, and why this page in particular needs to fetch a reference
+  // pose rather than borrow one from a default entry like the other pages
+  // do. Awaited before the heartbeat starts so it can never fire with a
+  // T-pose-ish capture.
+  await captureRestPoseRawQuats();
+  requestAnimationFrame(idleHeartbeatTick);
+  window.__vrm = vrm;
+}
+
+// --- Sentence matching + playback (new, 2026-10-03) -----------------------
+// v1 scope, as agreed with AK: type space-separated gloss words; a
+// multi-word gloss (e.g. "TRAIN STATION") is typed as-is and matched as one
+// unit via the greedy longest-phrase-first matcher below -- no NLP, no
+// English-to-gloss translation, no reordering. Only words with a saved gold
+// pick (gold_instances.json) are matchable, since sentence assembly plays
+// back each word's GOLD instance specifically, same as the review tool.
+// If every token in the sentence resolves, play the matched words back to
+// back with a hard jump-cut between them (no blending -- explicit v1 scope
+// call, to be revisited). If even one token fails to match, the whole
+// sentence is dropped and "STOP!" plays instead, per AK's instruction.
+let SUMMARY = null;
+let goldLookup = {};   // normalized phrase -> { word, library, index }
+let maxPhraseWords = 1;
+let englishLookup = {}; // normalized English sentence -> gloss word array
+
+function normalizePhrase(s) {
+  return s.toUpperCase().replace(/[^A-Z0-9' ]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function buildGoldLookup() {
+  goldLookup = {};
+  maxPhraseWords = 1;
+  for (const [word, g] of Object.entries(SUMMARY.gold)) {
+    const entries = SUMMARY.libraries[g.library] && SUMMARY.libraries[g.library][word];
+    if (!entries) continue;
+    const idx = entries.findIndex((e) =>
+      e.signer_id === g.signer_id && e.session_id === g.session_id && e.utterance_id === g.utterance_id);
+    if (idx === -1) continue;
+    const norm = normalizePhrase(word);
+    goldLookup[norm] = { word, library: g.library, index: idx };
+    const wc = norm.split(" ").length;
+    if (wc > maxPhraseWords) maxPhraseWords = wc;
+  }
+}
+
+// Greedy longest-phrase-first match over the gold vocabulary. Small (<=38
+// word) vocab, so this is a cheap O(n * maxPhraseWords) scan, not anything
+// that needs real NLP.
+function matchSentence(raw) {
+  const norm = normalizePhrase(raw);
+  const tokens = norm.split(" ").filter(Boolean);
+  const queue = [];
+  let i = 0;
+  while (i < tokens.length) {
+    let matched = null;
+    for (let len = Math.min(maxPhraseWords, tokens.length - i); len >= 1; len--) {
+      const phrase = tokens.slice(i, i + len).join(" ");
+      if (goldLookup[phrase]) { matched = { ...goldLookup[phrase], len }; break; }
+    }
+    if (!matched) return { ok: false, failedAt: tokens[i], queue: [] };
+    queue.push(matched);
+    i += matched.len;
+  }
+  return { ok: tokens.length > 0, queue };
+}
+
+// Builds the English-sentence -> ISL-gloss-order lookup (2026-10-04). This
+// is NOT a translation model -- it's a table of the 21 sentences actually
+// captured in this dry-run corpus, with their gloss order reconstructed
+// directly from the corpus data itself (library entries for the same
+// signer/session/utterance, sorted by first frame -- verified against every
+// distinct sentence in the corpus, order is consistent across signers). No
+// ML/API involved: AK's own call, since the current corpus doesn't
+// represent real ISL and investing in a real translation model belongs with
+// the actual pilot's broader dictionary, not this dry run. Punctuation/case
+// are normalized on both sides (normalizePhrase), so "Yes, I agree!" and
+// "yes i agree" both hit the same row -- not special-cased per sentence.
+function buildEnglishLookup(translations) {
+  englishLookup = {};
+  for (const row of translations) {
+    englishLookup[normalizePhrase(row.english)] = row.gloss;
+  }
+}
+
+// Resolves an explicit, already-known gloss word sequence (from
+// englishLookup) into gold-library queue items -- same per-word resolution
+// matchSentence() does, but skipping the greedy phrase search since the
+// words are already known individually (no ambiguity to resolve).
+function resolveGlossSequence(glossWords) {
+  const queue = [];
+  for (const word of glossWords) {
+    const item = goldLookup[normalizePhrase(word)];
+    if (!item) return { ok: false, failedAt: word, queue: [] };
+    queue.push(item);
+  }
+  return { ok: true, queue };
+}
+
+function renderWordList() {
+  const words = Object.values(goldLookup).map((g) => g.word).sort();
+  document.getElementById("wordCount").textContent = String(words.length);
+  document.getElementById("wordList").textContent = words.join(" · ");
+}
+
+function renderSentenceList(translations) {
+  const sentences = translations.map((t) => t.english);
+  document.getElementById("sentenceCount").textContent = String(sentences.length);
+  document.getElementById("sentenceList").textContent = sentences.join(" · ");
+}
+
+function setStatus(msg) {
+  document.getElementById("statusLine").textContent = msg;
+}
+
+let playing = false;
+let rafId = null;
+const FRAME_MS = 20;
+
+function stopPlayback() {
+  playing = false;
+  document.getElementById("playBtn").textContent = "Play";
+  if (rafId) cancelAnimationFrame(rafId);
+  blendFrom = null;
+  beginRestBlend();
+  showRestPose = true;
+}
+
+// --- Word-to-word transition blending (Polish pass, 2026-10-05) ------------
+// v1 hard-cut from the last frame of one word straight to the first frame of
+// the next. Now: snapshot the finished word's final pose (every humanoid bone's
+// local rotation + face expression weights), and for the first BLEND_FRAMES of
+// the next word ease from that snapshot into the new word's own frames
+// (smoothstep). Only affects the first ~200ms of each word after the first;
+// the new word's content from then on is untouched. Hand-separation and
+// torso-clearance run after this, so blended in-between poses are protected
+// the same as real frames.
+const BLEND_FRAMES = 10; // 200 ms at FRAME_MS = 20
+let blendFrom = null;
+let blendIdx = 0;
+function snapshotPose() {
+  const quats = {};
+  for (const name of Object.keys(vrm.humanoid.humanBones)) {
+    const b = getBone(name);
+    if (b) quats[name] = b.quaternion.clone();
+  }
+  const expr = {};
+  if (vrm.expressionManager) {
+    for (const e of vrm.expressionManager.expressions) expr[e.expressionName] = vrm.expressionManager.getValue(e.expressionName);
+  }
+  return { quats, expr };
+}
+function applyTransitionBlend() {
+  if (!blendFrom || blendIdx >= BLEND_FRAMES) return;
+  const t = (blendIdx + 1) / (BLEND_FRAMES + 1);
+  const w = t * t * (3 - 2 * t);
+  const cur = new THREE.Quaternion();
+  for (const [name, q0] of Object.entries(blendFrom.quats)) {
+    const b = getBone(name);
+    if (!b) continue;
+    cur.copy(b.quaternion);
+    b.quaternion.copy(q0).slerp(cur, w);
+  }
+  if (vrm.expressionManager) {
+    for (const [name, v0] of Object.entries(blendFrom.expr)) {
+      const v1 = vrm.expressionManager.getValue(name);
+      if (v1 == null) continue;
+      vrm.expressionManager.setValue(name, v0 + (v1 - v0) * w);
+    }
+  }
+  blendIdx++;
+}
+
+// Entries are fetched ahead of time (the next word's data is requested while
+// the current word plays) so there is no network gap between words.
+const entryCache = new Map();
+function entryUrl(item) {
+  return `/api/gold/instance?library=${encodeURIComponent(item.library)}&word=${encodeURIComponent(item.word)}&index=${item.index}`;
+}
+function prefetchEntry(item) {
+  const url = entryUrl(item);
+  if (!entryCache.has(url)) entryCache.set(url, fetch(url).then((r) => r.json()).then(fillEntryHandGaps));
+  return entryCache.get(url);
+}
+async function loadGoldEntry(item) {
+  entry = await prefetchEntry(item);
+  curLibrary = item.library;
+  lastHandLocalQuat = { Right: null, Left: null };
+}
+
+// Plays `entry`'s frames once, start to finish, then resolves -- no looping
+// back to frame 0 (that's the single-word review behavior; sentence
+// playback moves on to the next queued word instead). Resolves immediately,
+// without finishing the frame range, if playback is interrupted (Stop).
+function playEntryFrames() {
+  return new Promise((resolve) => {
+    let frame = 0;
+    let lastT = 0;
+    window.setFrame(frame);
+    function tick(t) {
+      if (!playing) { resolve(); return; }
+      if (t - lastT >= FRAME_MS) {
+        lastT = t;
+        frame++;
+        if (frame >= entry.frame_ids.length) { resolve(); return; }
+        window.setFrame(frame);
+      }
+      rafId = requestAnimationFrame(tick);
+    }
+    rafId = requestAnimationFrame(tick);
+  });
+}
+
+async function playQueue(queue) {
+  playing = true;
+  document.getElementById("playBtn").textContent = "Stop";
+  blendFrom = null;
+  for (let i = 0; i < queue.length; i++) {
+    const item = queue[i];
+    if (!playing) break;
+    await loadGoldEntry(item);
+    if (i + 1 < queue.length) prefetchEntry(queue[i + 1]); // fetch next word while this one plays
+    await playEntryFrames();
+    if (playing) { blendFrom = snapshotPose(); blendIdx = 0; }
+  }
+  blendFrom = null;
+  playing = false;
+  document.getElementById("playBtn").textContent = "Play";
+  beginRestBlend();
+  showRestPose = true;
+}
+
+async function handleSubmit() {
+  if (playing) { stopPlayback(); return; }
+  const raw = document.getElementById("sentenceInput").value;
+  if (!raw.trim()) { setStatus("Type a sentence first."); return; }
+
+  // Try the known-English-sentence translation table first (an exact,
+  // normalized match against one of the 21 captured sentences) -- only if
+  // that doesn't match does this fall back to direct gloss-word matching,
+  // so the same input box keeps working for typed gloss sequences too.
+  const englishGloss = englishLookup[normalizePhrase(raw)];
+  if (englishGloss) {
+    const resolved = resolveGlossSequence(englishGloss);
+    if (resolved.ok) {
+      setStatus(`Translated: "${raw.trim()}" → ${resolved.queue.map((q) => q.word).join(" → ")}`);
+      await playQueue(resolved.queue);
+      return;
+    }
+    // Known sentence, but one of its gloss words has no gold pick (e.g. "A"
+    // isn't marked yet) -- play STOP! directly with the real reason, rather
+    // than falling through to matchSentence() on the raw English text,
+    // which would misleadingly blame an unrelated word like "is".
+    const stop = goldLookup[normalizePhrase("STOP!")];
+    setStatus(`"${raw.trim()}" needs "${resolved.failedAt}", which has no gold pick yet — playing STOP!`);
+    if (stop) await playQueue([stop]);
+    return;
+  }
+
+  const result = matchSentence(raw);
+  if (result.ok) {
+    setStatus(`Matched: ${result.queue.map((q) => q.word).join(" → ")}`);
+    await playQueue(result.queue);
+  } else {
+    const stop = goldLookup[normalizePhrase("STOP!")];
+    if (stop) {
+      setStatus(`Not fully covered (no match for "${result.failedAt}") — playing STOP!`);
+      await playQueue([stop]);
+    } else {
+      setStatus(`Not fully covered (no match for "${result.failedAt}") — and STOP! has no gold pick either.`);
+    }
+  }
+}
+
+async function initUi() {
+  const [summaryRes, translationsRes] = await Promise.all([
+    fetch("/api/gold/summary"),
+    fetch("/data/sentence_translations.json"),
+  ]);
+  SUMMARY = await summaryRes.json();
+  const translations = await translationsRes.json();
+  buildGoldLookup();
+  buildEnglishLookup(translations);
+  renderWordList();
+  renderSentenceList(translations);
+  setStatus(`Ready — ${Object.keys(goldLookup).length} words, ${translations.length} known sentences.`);
+  document.getElementById("playBtn").addEventListener("click", handleSubmit);
+  document.getElementById("sentenceInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") handleSubmit();
+  });
+}
+
+(async function init() {
+  await initVrm();
+  await initUi();
+})().catch((e) => {
+  setStatus("Init error: " + String((e && e.stack) || e));
+  console.error(e);
+});
+</script>
+</body>
+</html>
