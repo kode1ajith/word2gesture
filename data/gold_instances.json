@@ -257,5 +257,12 @@
     "session_id": "Session_002",
     "utterance_id": "US2011",
     "marked_at": "2026-10-03T05:32:57.596Z"
+  },
+  "A": {
+    "library": "dh_library",
+    "signer_id": "Signer_002",
+    "session_id": "Session_004",
+    "utterance_id": "US219_2",
+    "marked_at": "2026-10-03T09:12:43.650Z"
   }
 }

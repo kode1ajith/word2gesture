@@ -1,0 +1,112 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Bind pose / rig facing check</title>
+<style> html,body{margin:0;padding:0;background:#dde3ea;} canvas{display:block;} </style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/node_modules/three/build/three.module.js",
+    "three/addons/": "/node_modules/three/examples/jsm/",
+    "@pixiv/three-vrm": "/node_modules/@pixiv/three-vrm/lib/three-vrm.module.js"
+  }
+}
+</script>
+</head>
+<body>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { VRMLoaderPlugin, VRMUtils } from "@pixiv/three-vrm";
+
+const W = 800, H = 800;
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setSize(W, H);
+renderer.setClearColor(0xdde3ea, 1);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(28, W / H, 0.1, 20);
+scene.add(new THREE.AmbientLight(0xffffff, 1.1));
+const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+dir.position.set(1, 2, 2);
+scene.add(dir);
+
+// Ground-plane grid + a world-axis gizmo (red=+X, green=+Y, blue=+Z) so
+// facing direction is unambiguous from any render, not just inferred.
+const grid = new THREE.GridHelper(2, 10, 0x888888, 0xbbbbbb);
+grid.position.y = 0;
+scene.add(grid);
+const axes = new THREE.AxesHelper(0.5);
+axes.position.set(-0.6, 0, 0);
+scene.add(axes);
+
+const loader = new GLTFLoader();
+loader.register((parser) => new VRMLoaderPlugin(parser));
+
+let vrm = null;
+let skeletonHelper = null;
+
+window.__load = async function () {
+  const gltf = await loader.loadAsync("/models/sample.vrm");
+  vrm = gltf.userData.vrm;
+  VRMUtils.rotateVRM0(vrm);
+  scene.add(vrm.scene);
+  // NOTE: deliberately NOT calling vrm.scene.rotation anything, NOT applying
+  // any pose -- this is the model exactly as it loads, true bind pose.
+  //
+  // NOT using THREE.SkeletonHelper(vrm.scene): it grabs the skeleton of the
+  // FIRST SkinnedMesh found in traversal order, which for this model is a
+  // clothing mesh whose bone list starts with secondary/physics "jiggle"
+  // bones and leg-roll helpers (J_Sec_R_TopsUpperLegSide, J_Roll_R_UpperLeg,
+  // ...) -- not a sane view of the actual humanoid rig. Building an explicit
+  // line set from the real humanoid bone chain instead (the exact bones
+  // applyPose()/applyHand() in the main renderer manipulate), so this
+  // actually shows what the pose code sees.
+  const HUMANOID_CHAIN = [
+    ["hips","spine"], ["spine","chest"], ["chest","upperChest"], ["upperChest","neck"], ["neck","head"],
+    ["chest","leftShoulder"], ["leftShoulder","leftUpperArm"], ["leftUpperArm","leftLowerArm"], ["leftLowerArm","leftHand"],
+    ["chest","rightShoulder"], ["rightShoulder","rightUpperArm"], ["rightUpperArm","rightLowerArm"], ["rightLowerArm","rightHand"],
+    ["hips","leftUpperLeg"], ["leftUpperLeg","leftLowerLeg"], ["leftLowerLeg","leftFoot"],
+    ["hips","rightUpperLeg"], ["rightUpperLeg","rightLowerLeg"], ["rightLowerLeg","rightFoot"],
+  ];
+  const linePositions = [];
+  for (const [a, b] of HUMANOID_CHAIN) {
+    const boneA = vrm.humanoid.getRawBoneNode(a);
+    const boneB = vrm.humanoid.getRawBoneNode(b);
+    if (!boneA || !boneB) continue;
+    const pa = new THREE.Vector3(), pb = new THREE.Vector3();
+    boneA.getWorldPosition(pa);
+    boneB.getWorldPosition(pb);
+    linePositions.push(pa.x, pa.y, pa.z, pb.x, pb.y, pb.z);
+  }
+  const lineGeom = new THREE.BufferGeometry();
+  lineGeom.setAttribute("position", new THREE.Float32BufferAttribute(linePositions, 3));
+  skeletonHelper = new THREE.LineSegments(lineGeom, new THREE.LineBasicMaterial({ color: 0x1144ff }));
+  skeletonHelper.visible = false;
+  scene.add(skeletonHelper);
+  window.__ready = true;
+};
+
+window.__setView = function (camPos, lookAt) {
+  camera.position.set(...camPos);
+  camera.lookAt(...lookAt);
+};
+window.__showSkin = function (show) {
+  vrm.scene.traverse((o) => { if (o.isSkinnedMesh || o.isMesh) o.visible = show; });
+};
+window.__showSkeleton = function (show) {
+  skeletonHelper.visible = show;
+};
+window.__render = function () {
+  renderer.render(scene, camera);
+};
+window.__scene = scene;
+window.__camera = camera;
+window.__renderer = renderer;
+window.__vrm = () => vrm;
+window.THREE = THREE;
+</script>
+</body>
+</html>
